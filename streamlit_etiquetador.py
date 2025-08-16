@@ -1,18 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Streamlit port corregido y pulido (alineado con etiquetador_Version21_Version4.py)
-
-Cambios principales (2025-08-16):
-- Añadida función build_etiquetas_from_state(state) (stateless) para poder probar y comparar
-  la lista de etiquetas sin generar el PDF.
-- Reemplazado el comportamiento de apertura automática por un botón "Abrir en nueva pestaña".
-- Reducción visual del 30% de la UI mediante CSS (escalado).
-- Lotes y campos dinámicos usan UID estables para no perder foco.
-- Las etiquetas "Lote X ID" pasan a mostrar el nombre actual del lote (actualización en tiempo real).
-- Sincronización de viales_multiplicadores para evitar duplicados y repetición de Blanco/Wash.
-- El archivo contiene además helpers para pruebas y depuración.
-"""
 from io import BytesIO
 from datetime import datetime
 import re
@@ -606,20 +591,36 @@ def generar_pdf_bytes_and_next_start():
 
     return pdf_bytes, total_generated, int(next_start)
 
-# ---------- UI: scale down UI ~30% ----------
-# We inject CSS to scale down the whole app to ~70% (reducción 30%)
-SCALE = 0.70
+# ---------- UI: scale down UI ~50% ----------
+# Usamos 'zoom' para reducir al 50% y evitar problemas de mapeo de clics que pueden aparecer con transform:scale.
+SCALE = 0.50
 st.markdown(f"""
     <style>
-      /* Reduce UI scale to fit more on one page */
+      /* Reduce UI scale to ~{int(SCALE*100)}% usando zoom (mejor compatibilidad para clicks) */
       :root > .stApp {{
-        transform: scale({SCALE});
-        transform-origin: 0 0;
-        width: calc(100% / {SCALE});
+        zoom: {SCALE};
       }}
-      /* Slightly smaller headings */
+      /* Ajustes visuales compactos */
       .css-1d391kg h1, .css-1d391kg h2 {{
         font-size: 0.9em;
+      }}
+      /* Scrollable container para lista de viales */
+      .viales-scroll {{
+        max-height: 360px;
+        overflow-y: auto;
+        padding: 6px;
+        border: 1px solid #efefef;
+        background: #fbfbfb;
+        border-radius: 6px;
+      }}
+      /* Botones y controles un poco más compactos */
+      button[title=""] {{
+        padding: 6px 8px !important;
+        font-size: 0.9em !important;
+      }}
+      /* Asegurar que los controles sean clicables sin doble-click */
+      .stButton > button, .stCheckbox > div {{
+        cursor: pointer;
       }}
     </style>
 """, unsafe_allow_html=True)
@@ -636,10 +637,10 @@ with left_col:
     with c0:
         st.checkbox("Duplicado (A/B)", value=ss.dup_patron, key="dup_patron")
     with c1:
-        st.markdown("**Peso (patrón):**")
+        st.markdown("**Peso muestra:**")
         st.text_input("", value=ss.peso_patron, key="peso_patron", max_chars=12)
     with c2:
-        st.markdown("**Vol final (patrón):**")
+        st.markdown("**Vol final muestra:**")
         st.text_input("", value=ss.vol_patron, key="vol_patron", max_chars=12)
     with c3:
         st.markdown("")
@@ -660,6 +661,7 @@ with left_col:
             st.markdown("ID (opcional)")
             idt = st.text_input("", value=d.get("id_text",""), key=f"std_id_{uid}")
         with c4s:
+            # botón de eliminar con key único; el continue es suficiente para que la eliminación ocurra con un solo click
             if st.button("✕", key=f"del_std_{uid}"):
                 continue
         new_std.append({"uid": uid, "v_pip": v1, "v_final": v2, "id_text": idt})
@@ -677,10 +679,10 @@ with left_col:
 
     cw1, cw2 = st.columns([1,1])
     with cw1:
-        st.markdown("**Peso (patrón/muestra):**")
+        st.markdown("**Peso muestra:**")
         st.text_input("", value=ss.muestra_peso, key="muestra_peso", max_chars=12)
     with cw2:
-        st.markdown("**Vol final (patrón/muestra):**")
+        st.markdown("**Vol final muestra:**")
         st.text_input("", value=ss.muestra_vol, key="muestra_vol", max_chars=12)
 
     st.markdown("**Lotes**")
@@ -738,7 +740,7 @@ with left_col:
             per += [""] * (len(ss.lotes) - len(per))
         for li in range(len(ss.lotes)):
             lote_name = (ss.lotes[li].get("name","") or "").strip() or f"Lote{li+1}"
-            # label reflects lote name in real time
+            # label refleja lote name en tiempo real
             key = f"dm_{uid}_per_{li}"
             val = st.text_input(f"{lote_name} ID", value=per[li], key=key)
             per[li] = val
@@ -759,43 +761,48 @@ with right_col:
     st.text_input("Blanco:", value=ss.texto_blanco, key="texto_blanco")
     st.text_input("Wash:", value=ss.texto_wash, key="texto_wash")
 
-    st.markdown("**Lista de viales HPLC (multiplicadores)**")
-    items = construir_ids_viales_from_state({
-        "texto_blanco": ss.texto_blanco,
-        "texto_wash": ss.texto_wash,
-        "dup_patron": ss.dup_patron,
-        "dup_muestra": ss.dup_muestra,
-        "uniformidad": ss.uniformidad,
-        "lotes": ss.lotes,
-        "reactivos": ss.reactivos,
-        "diluciones_std": ss.diluciones_std
-    })
-    assign_colors_for_ids_for_state(items, {"id_color_map": ss.id_color_map, "lote_color_map": ss.lote_color_map, "lotes": ss.lotes})
-    # ensure viales_multiplicadores defaults and prune obsolete keys
-    for it in items:
-        vid = it["id"]
-        if vid not in ss.viales_multiplicadores:
-            ss.viales_multiplicadores[vid] = 0 if it["type"] == "reactivo" else 1
-    for k in list(ss.viales_multiplicadores.keys()):
-        if k not in [it["id"] for it in items]:
-            ss.viales_multiplicadores.pop(k, None)
+    # Usar expander con scroll (aceptado por el usuario)
+    with st.expander("Lista de viales HPLC (multiplicadores)", expanded=True):
+        items = construir_ids_viales_from_state({
+            "texto_blanco": ss.texto_blanco,
+            "texto_wash": ss.texto_wash,
+            "dup_patron": ss.dup_patron,
+            "dup_muestra": ss.dup_muestra,
+            "uniformidad": ss.uniformidad,
+            "lotes": ss.lotes,
+            "reactivos": ss.reactivos,
+            "diluciones_std": ss.diluciones_std
+        })
+        assign_colors_for_ids_for_state(items, {"id_color_map": ss.id_color_map, "lote_color_map": ss.lote_color_map, "lotes": ss.lotes})
+        # ensure viales_multiplicadores defaults and prune obsolete keys
+        for it in items:
+            vid = it["id"]
+            if vid not in ss.viales_multiplicadores:
+                ss.viales_multiplicadores[vid] = 0 if it["type"] == "reactivo" else 1
+        for k in list(ss.viales_multiplicadores.keys()):
+            if k not in [it["id"] for it in items]:
+                ss.viales_multiplicadores.pop(k, None)
 
-    for it in items:
-        vid = it["id"]
-        color = ss.id_color_map.get(vid, "#cccccc")
-        c1, c2 = st.columns([0.12, 1])
-        with c1:
-            if ss.show_color_square:
-                st.markdown(f"<div style='width:14px;height:12px;background:{color};border:1px solid #000'></div>", unsafe_allow_html=True)
-        with c2:
-            subc1, subc2 = st.columns([3,1])
-            with subc1:
-                st.text(vid)
-            with subc2:
-                default = int(ss.viales_multiplicadores.get(vid, 0 if it["type"] == "reactivo" else 1))
-                key = sanitize_key(f"mult_{vid}")
-                val = st.number_input("", min_value=0, value=default, step=1, key=key)
-                ss.viales_multiplicadores[vid] = int(val)
+        # envolver en un div scrollable (CSS definido arriba)
+        st.markdown("<div class='viales-scroll'>", unsafe_allow_html=True)
+        for it in items:
+            vid = it["id"]
+            color = ss.id_color_map.get(vid, "#cccccc")
+            c1, c2 = st.columns([0.12, 1])
+            with c1:
+                if ss.show_color_square:
+                    st.markdown(f"<div style='width:14px;height:12px;background:{color};border:1px solid #000'></div>", unsafe_allow_html=True)
+            with c2:
+                subc1, subc2 = st.columns([3,1])
+                with subc1:
+                    st.text(vid)
+                with subc2:
+                    default = int(ss.viales_multiplicadores.get(vid, 0 if it["type"] == "reactivo" else 1))
+                    key = sanitize_key(f"mult_{vid}")
+                    # number_input con key estable; actualizar ss directamente
+                    val = st.number_input("", min_value=0, value=default, step=1, key=key)
+                    ss.viales_multiplicadores[vid] = int(val)
+        st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
     st.subheader("Placebo y Reactivos")
@@ -881,4 +888,4 @@ with right_col:
         st.download_button("Descargar PDF", data=ss.last_pdf, file_name=filename, mime="application/pdf")
 
 st.markdown("---")
-st.caption("La aplicación recuerda los valores durante la sesión (no guarda en disco).")
+st.caption("Hecho por YAK (con ayuda de Copilot 😉)")
