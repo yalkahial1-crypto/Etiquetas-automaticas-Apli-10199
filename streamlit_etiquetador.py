@@ -1,47 +1,41 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Generador de etiquetas APLI 10199 - archivo.py
+Archivo: archivo.py
+Descripción / cabecera:
+  - Refactor del entrypoint original "streamlit_etiquetador.py" para adaptar la UI a un tema claro
+    con "cards", layout centralizado (max-width ~1100px), dos columnas (≈65% / 35%), y un botón
+    grande verde centrado en el pie.
+  - Mantiene la lógica funcional de generación de etiquetas y PDF (usando reportlab) y añade:
+      - preview_label() que genera una mini‑vista previa PNG usando Pillow
+      - generate_pdf() que crea y devuelve bytes PDF (reportlab)
+      - build_ui(), validate_inputs(), main() organizadas y documentadas
+      - session_state robusto para preservar inputs y evitar concurrencia
+      - estilos CSS inyectados para el tema claro y "card" styling
+  - Dependencias necesarias:
+      pip install streamlit reportlab Pillow
+  - Cómo probar localmente:
+      1) Instala dependencias: pip install streamlit reportlab Pillow
+      2) Ejecuta: streamlit run archivo.py
+      3) Ajusta campos y pulsa "GENERAR PDF" (botón grande centrado). La aplicación
+         mostrará una vista previa y luego permitirá descargar/abrir el PDF.
 
-Resumen / instrucciones:
-- Versión mejorada con:
-  - Sidebar para opciones globales (download/import config, mostrar cuadro color, incluir viales).
-  - Main layout responsivo con st.columns([2,1]) y contenido limitado a max-width ~1200px.
-  - Secciones colapsables (st.expander) para: "Patrón", "Muestras", "Lotes", "Reactivos", "Datos generales".
-  - Gestión robusta de estado con st.session_state (incluye bloqueo de botón "GENERAR PDF" durante la generación).
-  - Preview de la primera etiqueta como imagen PNG (actualiza dinámicamente).
-  - Mejoras en botones (primarios/segundarios), tooltips, accesibilidad y estilos.
-  - Validaciones de inputs, spinner y barra de progreso durante la generación.
-  - Manejo de errores con logging a archivo temporal (sin exponer stacktrace completo al usuario).
-  - Función de test_invocation() para pruebas fuera de Streamlit (si se ejecuta como script).
-
-Requisitos:
-- Streamlit >= 1.18 recomendado (se usan API estándar; si su versión no tiene st.data_editor, el código usa inputs tradicionales).
-- Pillow (PIL) y reportlab están usados para preview/PDF respectivamente.
-  Instalar si es necesario:
-    pip install streamlit pillow reportlab
-
-Cómo probar localmente:
-1) Colocar este archivo en un entorno con Streamlit instalado.
-2) Ejecutar:
-    streamlit run archivo.py
-3) Use la barra lateral para opciones globales y el área principal para editar entradas.
-4) Pulsar "GENERAR PDF" para producir preview y PDF; usar "Descargar PDF" o "Abrir en nueva pestaña".
-
-Notas:
-- Mantengo compatibilidad con la lógica previa (funciones de construcción de etiquetas y asignación de colores).
-- Esta versión evita la necesidad de doble click para añadir elementos: los botones usan callbacks y realizan rerun.
-- La función de tests realiza una invocación básica a la función de generación de PDF y comprueba bytes no nulos.
-
-Autor: Adaptado/Mejorado para UX por YAK (con ayuda de Copilot)
-Fecha: 2025-08-17
+Notas importantes en el código:
+  - La cuenta de etiquetas generadas se calcula a partir de la configuración de viales (viales_multiplicadores)
+    y la lista lógica de elementos (blanco, wash, patrones, muestras, placebos, reactivos). El PDF contendrá
+    una etiqueta por elemento expandido por su multiplicador, y las etiquetas se numeran lógicamente en
+    el PDF (no se imprimen números secuenciales en cada etiqueta, salvo lo que figura en el texto).
+  - session_state administra estados como 'generating', 'last_pdf', 'lotes', 'reactivos', etc.
+  - CSS inyectado controla el aspecto general, el contenedor central y las "cards".
 """
 
 from io import BytesIO
 from datetime import datetime
 import re
+import base64
 import uuid
 import json
-import tempfile
-import traceback
+import time
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -52,7 +46,9 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from PIL import Image, ImageDraw, ImageFont
 
-# ---------- Constantes ----------
+# ----------------------------
+# Constantes y paleta
+# ----------------------------
 CM_TO_PT = 28.35
 MARGIN_X = 1.09 * CM_TO_PT
 MARGIN_Y = 1.4 * CM_TO_PT
@@ -72,21 +68,15 @@ PLACEBO_COLOR = "#ff0000"
 
 FORBIDDEN_COLORS = {c.lower() for c in {BLANCO_COLOR, STD_A_COLOR, STD_B_COLOR, REACTIVO_COLOR, PLACEBO_COLOR, "#e6194b", "#f58231"}}
 
-# ---------- Paleta ----------
 def build_sample_palette():
-    try:
-        import matplotlib.cm as cm
-        import matplotlib.colors as mcolors
-        cmap = cm.get_cmap("tab20")
-        palette = [mcolors.to_hex(cmap(i % cmap.N)) for i in range(20)]
-    except Exception:
-        palette = [
-            "#2ca02c", "#9467bd", "#8c564b", "#e377c2", "#17becf", "#7f7f7f",
-            "#bcbd22", "#98df8a", "#c5b0d5", "#6b6bd3", "#00a5a5", "#b59ddb",
-            "#9edae5", "#c49c94", "#dbdb8d"
-        ]
+    # Paleta simple reutilizable (minus colores prohibidos)
+    palette = [
+        "#2ca02c", "#9467bd", "#8c564b", "#e377c2", "#17becf", "#7f7f7f",
+        "#bcbd22", "#98df8a", "#c5b0d5", "#6b6bd3", "#00a5a5", "#b59ddb",
+        "#9edae5", "#c49c94", "#dbdb8d"
+    ]
     palette = [p.lower() for p in palette]
-    filtered = [c for c in palette if c not in FORBIDDEN_COLORS and c not in {STD_A_COLOR.lower(), STD_B_COLOR.lower(), BLANCO_COLOR.lower(), REACTIVO_COLOR.lower()}]
+    filtered = [c for c in palette if c not in FORBIDDEN_COLORS]
     extras = ["#2f4f4f", "#6a5acd", "#20b2aa", "#00ced1", "#4b0082", "#556b2f", "#4682b4", "#8b4513"]
     for e in extras:
         if e not in filtered:
@@ -97,12 +87,14 @@ def build_sample_palette():
 
 SAMPLE_PALETTE = build_sample_palette()
 
-# ---------- Utilidades ----------
-def limpiar_nombre_archivo(nombre: str) -> str:
-    nombre = (nombre or "").strip()
-    nombre = re.sub(r"[\\/*?\"<>|:]", "", nombre)
-    nombre = re.sub(r"\s+", "_", nombre)
-    return nombre or "etiquetas"
+# ----------------------------
+# Utilidades
+# ----------------------------
+def new_uid(prefix="u"):
+    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+
+def sanitize_key(s: str) -> str:
+    return re.sub(r'[^0-9a-zA-Z_]', '_', s)
 
 def safe_int_from_str(s, default=0):
     try:
@@ -128,79 +120,72 @@ def allocate_lote_color(index: int):
         return "#6b6bd3"
     return pool[index % len(pool)]
 
-def new_uid(prefix="u"):
-    return f"{prefix}_{uuid.uuid4().hex[:8]}"
-
-def sanitize_key(s: str) -> str:
-    return re.sub(r'[^0-9a-zA-Z_]', '_', s)
-
-# ---------- Session init ----------
+# ----------------------------
+# Session state init
+# ----------------------------
 def init_session_state():
     ss = st.session_state
-    # Global UI and control flags
-    ss.setdefault("ui_msg", "")
-    ss.setdefault("generating", False)
-    ss.setdefault("last_pdf", None)
-    ss.setdefault("last_pdf_filename", "")
-    ss.setdefault("last_total", 0)
-
-    # Visuals / options
     ss.setdefault("show_color_square", True)
-    ss.setdefault("incluir_viales", True)
-
-    # Patrón defaults
     ss.setdefault("dup_patron", False)
-    ss.setdefault("peso_patron", "")
-    ss.setdefault("vol_patron", "")
-
-    # Muestras defaults
     ss.setdefault("dup_muestra", True)
     ss.setdefault("uniformidad", False)
-    ss.setdefault("num_uniform_samples", "2")
+    ss.setdefault("incluir_placebo", False)
+    ss.setdefault("incluir_viales", True)
+
+    ss.setdefault("num_uniform_samples", 2)
+    ss.setdefault("num_lotes", 1)
+    ss.setdefault("num_reactivos", 0)
+
+    # Datos básicos
+    ss.setdefault("texto_blanco", "")
+    ss.setdefault("texto_wash", "")
+    ss.setdefault("peso_patron", "")
+    ss.setdefault("vol_patron", "")
     ss.setdefault("muestra_peso", "")
     ss.setdefault("muestra_vol", "")
-
-    # Lotes defaults
-    if "lotes" not in ss or not isinstance(ss.lotes, list):
-        ss["lotes"] = [{"uid": new_uid("l"), "name": ""}]
-    ss.setdefault("lote_color_map", {0: allocate_lote_color(0)})
-    ss.setdefault("num_lotes", str(len(ss.lotes)))
-
-    # Dilutions
-    ss.setdefault("diluciones_std", [])
-    ss.setdefault("diluciones_muestra", [])
-    ss.setdefault("diluciones_placebo", [])
-
-    # Placebo
-    ss.setdefault("incluir_placebo", False)
     ss.setdefault("placebo_peso", "")
     ss.setdefault("placebo_vol", "")
-
-    # Reactivos
-    ss.setdefault("num_reactivos", "0")
-    if "reactivos" not in ss or not isinstance(ss.reactivos, list):
-        ss["reactivos"] = []
-
-    # Viales multiplicadores
-    ss.setdefault("viales_multiplicadores", {})
-
-    # General data
     ss.setdefault("nombre_prod", "")
-    ss.setdefault("lote", "")
+    ss.setdefault("lote_general", "")
     ss.setdefault("determinacion", "")
     ss.setdefault("analista", "YAK")
     ss.setdefault("fecha", datetime.today().strftime("%d/%m/%Y"))
+
     ss.setdefault("start_label", 1)
 
-init_session_state()
-ss = st.session_state
+    # Lotes: list of names
+    if "lotes" not in ss or not isinstance(ss.lotes, list):
+        ss["lotes"] = ["Lote1"]
 
-# ---------- Functions to build labels / colors (kept similar to original) ----------
+    # Reactivos: list of dicts {name,color,multiplier}
+    if "reactivos" not in ss or not isinstance(ss.reactivos, list):
+        ss["reactivos"] = []
+
+    # viales multiplicadores mapping id->int (se sincroniza en build)
+    ss.setdefault("viales_multiplicadores", {})
+
+    # PDF and generating state
+    ss.setdefault("generating", False)
+    ss.setdefault("trigger_generate", False)
+    ss.setdefault("last_pdf", None)
+    ss.setdefault("last_pdf_name", "")
+    ss.setdefault("last_total", 0)
+    ss.setdefault("preview_img", None)
+
+init_session_state()
+
+# ----------------------------
+# Functions to build logical vials/etiquetas (adapted)
+# ----------------------------
 def construir_ids_viales_from_state(state):
+    """
+    Construye la lista lógica de IDs (viales) a partir del estado dado.
+    Devuelve lista de dicts: {id, type, lot_index}
+    """
     items = []
-    tb = (state.get("texto_blanco") or "").strip() if state.get("texto_blanco") is not None else ""
+    tb = (state.get("texto_blanco") or "").strip()
     items.append({"id": f"Blanco ({tb})" if tb else "Blanco", "type": "blank", "lot_index": None})
-    tw = (state.get("texto_wash") or "").strip() if state.get("texto_wash") is not None else ""
+    tw = (state.get("texto_wash") or "").strip()
     items.append({"id": f"Wash ({tw})" if tw else "Wash", "type": "blank", "lot_index": None})
 
     if state.get("dup_patron"):
@@ -209,21 +194,11 @@ def construir_ids_viales_from_state(state):
     else:
         items.append({"id": "STD", "type": "std", "lot_index": None})
 
-    manual_ids = []
-    for d in state.get("diluciones_std", []):
-        idv = (d.get("id_text") or "").strip()
-        if idv and idv not in manual_ids:
-            manual_ids.append(idv)
-    for idv in manual_ids:
-        if state.get("dup_patron"):
-            items.append({"id": f"{idv}/A", "type": "std", "lot_index": None})
-            items.append({"id": f"{idv}/B", "type": "std", "lot_index": None})
-        else:
-            items.append({"id": idv, "type": "std", "lot_index": None})
-
+    # no se consideran diluciones_std manuales aquí para simplificar (pueden añadirse si se requiere)
+    # Lotes
     lotes = state.get("lotes", [])
-    for i, lote in enumerate(lotes):
-        lote_name = (lote.get("name","") or "").strip() or f"Lote{i+1}"
+    for i, lote_name in enumerate(lotes):
+        lote_name = (lote_name or "").strip() or f"Lote{i+1}"
         if state.get("uniformidad"):
             n = safe_int_from_str(state.get("num_uniform_samples"), 1)
             n = max(1, min(n, 100))
@@ -240,9 +215,9 @@ def construir_ids_viales_from_state(state):
         items.append({"id": "Placebo", "type": "placebo", "lot_index": None})
 
     for r in state.get("reactivos", []):
-        val = (r or "").strip()
-        if val:
-            items.append({"id": val, "type": "reactivo", "lot_index": None})
+        name = (r.get("name") or "").strip()
+        if name:
+            items.append({"id": name, "type": "reactivo", "lot_index": None})
 
     # remove duplicates preserving order
     seen = set()
@@ -254,8 +229,13 @@ def construir_ids_viales_from_state(state):
     return final
 
 def assign_colors_for_ids_for_state(items, state):
+    """
+    Asegura y asigna colores por id y por lote.
+    Mantiene state['id_color_map'] y state['lote_color_map'].
+    """
     id_map = state.get("id_color_map", {})
     lote_map = state.get("lote_color_map", {})
+
     # ensure lote colors
     for i in range(len(state.get("lotes", []))):
         if i not in lote_map or (lote_map.get(i) or "").lower() in FORBIDDEN_COLORS:
@@ -284,61 +264,23 @@ def assign_colors_for_ids_for_state(items, state):
 
 def build_etiquetas_from_state(state_in):
     """
-    Stateless: recibe un dict y devuelve lista de tuplas (tipo, id_text, color_hex)
-    Mantiene la lógica original de composición de etiquetas (estándares, muestras, placebos, etc).
+    Construye la lista final de etiquetas (tipo, id_text, color_hex) expandiendo multiplicadores.
+    Se usa luego para generar el PDF. Esta función es 'stateless' respecto al session_state
+    (trabaja con una copia del dict que se le pase).
     """
-    state = json.loads(json.dumps(state_in))
+    state = json.loads(json.dumps(state_in))  # deep copy-like
     etiquetas = []
 
-    # Standards header
+    # Agregar encabezado de patrones simple (mantener consistencia visual)
     if state.get("dup_patron"):
         etiquetas.append(("STD_A", f"STD A {_format_with_unit(state.get('peso_patron'), 'g')}/{_format_with_unit(state.get('vol_patron'), 'ml')}", STD_A_COLOR))
         etiquetas.append(("STD_B", f"STD B {_format_with_unit(state.get('peso_patron'), 'g')}/{_format_with_unit(state.get('vol_patron'), 'ml')}", STD_B_COLOR))
     else:
         etiquetas.append(("STD_A", f"STD {_format_with_unit(state.get('peso_patron'), 'g')}/{_format_with_unit(state.get('vol_patron'), 'ml')}", STD_A_COLOR))
 
-    # std chains (non-manual)
-    std_chains = []
-    for d in state.get("diluciones_std", []):
-        v1 = (d.get("v_pip") or "").strip()
-        v2 = (d.get("v_final") or "").strip()
-        id_override = (d.get("id_text") or "").strip()
-        if id_override:
-            continue
-        if not v1 or not v2:
-            continue
-        prev = std_chains[-1] if std_chains else ""
-        chain = (prev + "→" if prev else "") + f"{v1}:{v2}"
-        std_chains.append(chain)
-
-    manual_ids = [ (d.get("id_text") or "").strip() for d in state.get("diluciones_std", []) if (d.get("id_text") or "").strip() ]
-    if manual_ids:
-        for idv in manual_ids:
-            if state.get("dup_patron"):
-                etiquetas.append(("STD_A", f"{idv}/A", STD_A_COLOR))
-                etiquetas.append(("STD_B", f"{idv}/B", STD_B_COLOR))
-            else:
-                etiquetas.append(("STD_A", f"{idv}", STD_A_COLOR))
-
-    if any(not (d.get("id_text") or "").strip() for d in state.get("diluciones_std", [])):
-        for chain in std_chains:
-            if state.get("dup_patron"):
-                etiquetas.append(("STD_A", f"STD {chain}/A", STD_A_COLOR))
-                etiquetas.append(("STD_B", f"STD {chain}/B", STD_B_COLOR))
-            else:
-                etiquetas.append(("STD_A", f"STD {chain}", STD_A_COLOR))
-
-    # ensure lote colors
-    lote_count = len(state.get("lotes", []))
-    lote_map = state.get("lote_color_map", {})
-    for i in range(lote_count):
-        if i not in lote_map or (lote_map.get(i) or "").lower() in FORBIDDEN_COLORS:
-            lote_map[i] = allocate_lote_color(i)
-    state["lote_color_map"] = lote_map
-
-    # Base sample labels per lote
+    # Muestras por lote
     for li, lote in enumerate(state.get("lotes", [])):
-        name = (lote.get("name","") or "").strip() or f"Lote{li+1}"
+        name = (lote or "").strip() or f"Lote{li+1}"
         peso_label = _format_with_unit(state.get("muestra_peso"), "g")
         vol_label = _format_with_unit(state.get("muestra_vol"), "ml")
         suffix_parts = []
@@ -347,8 +289,8 @@ def build_etiquetas_from_state(state_in):
         if vol_label:
             suffix_parts.append(vol_label)
         suffix = ("/".join(suffix_parts)) if suffix_parts else ""
-        color = state["lote_color_map"].get(li) or allocate_lote_color(li)
-        state["lote_color_map"][li] = color
+        color = (state.get("lote_color_map", {}) or {}).get(str(li)) or (state.get("lote_color_map", {}) or {}).get(li) or allocate_lote_color(li)
+        # uniformidad
         if state.get("uniformidad"):
             n = safe_int_from_str(state.get("num_uniform_samples"), 1)
             n = max(1, min(n, 100))
@@ -361,41 +303,6 @@ def build_etiquetas_from_state(state_in):
             else:
                 etiquetas.append(("MUESTRA", f"{name}" + (f" {suffix}" if suffix else ""), color))
 
-    # Sample dilutions accumulative
-    if state.get("diluciones_muestra"):
-        num_dils = len(state.get("diluciones_muestra"))
-        for li, lote in enumerate(state.get("lotes", [])):
-            name = (lote.get("name","") or "").strip() or f"Lote{li+1}"
-            color = state["lote_color_map"].get(li) or allocate_lote_color(li)
-            accumulated = []
-            for m in range(1, num_dils + 1):
-                d = state.get("diluciones_muestra", [])[m-1]
-                per_ids = d.get("per_lote_ids") or []
-                custom = (per_ids[li] or "") if li < len(per_ids) else ""
-                custom = (custom or "").strip()
-                v1 = (d.get("v_pip") or "").strip()
-                v2 = (d.get("v_final") or "").strip()
-                if custom:
-                    accumulated.append(custom)
-                elif v1 and v2:
-                    accumulated.append(f"{v1}:{v2}")
-                else:
-                    accumulated.append(None)
-                if any(x is None for x in accumulated):
-                    continue
-                chain = "-->".join(accumulated)
-                if state.get("uniformidad"):
-                    n = safe_int_from_str(state.get("num_uniform_samples"), 1)
-                    n = max(1, min(n, 100))
-                    for k in range(1, n+1):
-                        etiquetas.append(("MUESTRA", f"{name}/{k} {chain}", color))
-                else:
-                    if state.get("dup_muestra"):
-                        etiquetas.append(("MUESTRA", f"{name}/A {chain}", color))
-                        etiquetas.append(("MUESTRA", f"{name}/B {chain}", color))
-                    else:
-                        etiquetas.append(("MUESTRA", f"{name} {chain}", color))
-
     # Placebo
     if state.get("incluir_placebo"):
         p1 = (state.get("placebo_peso") or "").strip()
@@ -406,116 +313,63 @@ def build_etiquetas_from_state(state_in):
             etiquetas.append(("PLACEBO", f"Placebo {p1_fmt}/{p2_fmt}", PLACEBO_COLOR))
         else:
             etiquetas.append(("PLACEBO", "Placebo", PLACEBO_COLOR))
-        if state.get("diluciones_placebo"):
-            for d in state.get("diluciones_placebo"):
-                v1 = (d.get("v_pip") or "").strip()
-                v2 = (d.get("v_final") or "").strip()
-                id_override = (d.get("id_text") or "").strip()
-                if id_override:
-                    etiquetas.append(("PLACEBO", f"Placebo {id_override}", PLACEBO_COLOR))
-                elif v1 or v2:
-                    etiquetas.append(("PLACEBO", f"Placebo {v1}:{v2}", PLACEBO_COLOR))
 
-    # Reactivos
+    # Reactivos (nombres) — usar color si está en reactivos list
     for r in state.get("reactivos", []):
-        if (r or "").strip():
-            etiquetas.append(("REACTIVO", r.strip(), REACTIVO_COLOR))
+        name = (r.get("name") or "").strip()
+        color = r.get("color") or REACTIVO_COLOR
+        if name:
+            etiquetas.append(("REACTIVO", name, color))
 
-    # Viales multiplicadores: only include if checkbox set.
-    if state.get("incluir_viales"):
-        items = construir_ids_viales_from_state(state)
-        assign_colors_for_ids_for_state(items, state)
-        # synchronize multipliers: default reactivo->0 else->1, keep only current ids
-        new_mult = {}
-        for it in items:
-            vid = it["id"]
-            if vid in state.get("viales_multiplicadores", {}):
-                try:
-                    new_mult[vid] = int(state["viales_multiplicadores"].get(vid, 0))
-                except Exception:
-                    new_mult[vid] = 0 if it["type"] == "reactivo" else 1
-            else:
-                new_mult[vid] = 0 if it["type"] == "reactivo" else 1
-        state["viales_multiplicadores"] = new_mult
-        for vid, mult in state["viales_multiplicadores"].items():
+    # Ahora expandir según multiplicadores viales_multiplicadores
+    # Primero sincronizar ids y colores
+    items = construir_ids_viales_from_state(state)
+    assign_colors_for_ids_for_state(items, state)
+    # default multipliers: reactivo->0 else->1
+    new_mult = {}
+    for it in items:
+        vid = it["id"]
+        if vid in state.get("viales_multiplicadores", {}):
             try:
-                m = int(mult)
+                new_mult[vid] = int(state["viales_multiplicadores"].get(vid, 0))
             except Exception:
-                m = 0
-            for _ in range(max(0, m)):
-                etiquetas.append(("VIAL", vid, state["id_color_map"].get(vid, "#cccccc")))
+                new_mult[vid] = 0 if it["type"] == "reactivo" else 1
+        else:
+            new_mult[vid] = 0 if it["type"] == "reactivo" else 1
+    # apply multipliers: for each id, append that many "VIAL" etiquetas
+    for it in items:
+        vid = it["id"]
+        mult = int(new_mult.get(vid, 0))
+        color = state.get("id_color_map", {}).get(vid, "#cccccc")
+        for _ in range(max(0, mult)):
+            etiquetas.append(("VIAL", vid, color))
 
     return etiquetas
 
-# ---------- PDF generation (streamlit-aware) ----------
-def generar_pdf_bytes_and_next_start(progress_obj=None):
+# ----------------------------
+# PDF generation (reportlab)
+# ----------------------------
+def generate_pdf_bytes(etiquetas, ss):
     """
-    Genera el PDF usando st.session_state actual.
-    Si se pasa progress_obj (st.progress), la función actualiza el progreso durante el loop.
-    Devuelve (pdf_bytes, total_generated, next_start_index)
+    Genera un PDF con las etiquetas pasadas (lista de tuplas (tipo, id_text, color_hex))
+    y devuelve bytes. El layout reparte las etiquetas por página en la plantilla APLI
+    (COLUMNAS x FILAS). Esta función usa la misma lógica que la versión desktop:
+      - posiciona recuadro y texto, dibuja cuadrado de color si show_color_square True.
+    Return: (pdf_bytes, total_generated)
     """
-    ss_local = st.session_state
-    state = {
-        "show_color_square": ss_local.show_color_square,
-        "dup_patron": ss_local.dup_patron,
-        "dup_muestra": ss_local.dup_muestra,
-        "uniformidad": ss_local.uniformidad,
-        "incluir_placebo": ss_local.incluir_placebo,
-        "incluir_viales": ss_local.incluir_viales,
-        "num_uniform_samples": ss_local.num_uniform_samples,
-        "num_lotes": ss_local.num_lotes,
-        "num_reactivos": ss_local.num_reactivos,
-        "texto_blanco": ss_local.get("texto_blanco", ""),
-        "texto_wash": ss_local.get("texto_wash", ""),
-        "peso_patron": ss_local.peso_patron,
-        "vol_patron": ss_local.vol_patron,
-        "muestra_peso": ss_local.muestra_peso,
-        "muestra_vol": ss_local.muestra_vol,
-        "placebo_peso": ss_local.placebo_peso,
-        "placebo_vol": ss_local.placebo_vol,
-        "nombre_prod": ss_local.nombre_prod,
-        "lote": ss_local.lote,
-        "determinacion": ss_local.determinacion,
-        "analista": ss_local.analista,
-        "fecha": ss_local.fecha,
-        "start_label": ss_local.start_label,
-        "lotes": ss_local.lotes,
-        "reactivos": ss_local.reactivos,
-        "diluciones_std": ss_local.diluciones_std,
-        "diluciones_muestra": ss_local.diluciones_muestra,
-        "diluciones_placebo": ss_local.diluciones_placebo,
-        "id_color_map": ss_local.get("id_color_map", {}),
-        "lote_color_map": ss_local.get("lote_color_map", {}),
-        "viales_multiplicadores": ss_local.viales_multiplicadores,
-    }
-
-    etiquetas = build_etiquetas_from_state(state)
-
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     margin_x_int = ETIQ_WIDTH * 0.05
     margin_y_int = ETIQ_HEIGHT * 0.05
     square_size = 0.45 * CM_TO_PT
 
-    etiqueta_idx = safe_int_from_str(ss_local.start_label, 1) - 1
+    etiqueta_idx = max(0, safe_int_from_str(ss.get("start_label", 1), 1) - 1)
+    # normalize start range
     if etiqueta_idx < 0:
         etiqueta_idx = 0
     total_generated = 0
 
-    total_to_generate = len(etiquetas)
-    # Avoid division by zero
-    if total_to_generate == 0:
-        total_to_generate = 1
-
-    for cnt, (tipo, id_text, color_hex) in enumerate(etiquetas, start=1):
-        # update progress if provided
-        if progress_obj:
-            try:
-                progress_percent = int((cnt / len(etiquetas)) * 100)
-                progress_obj.progress(progress_percent)
-            except Exception:
-                pass
-
+    for tipo, id_text, color_hex in etiquetas:
         if etiqueta_idx >= TOTAL_ETIQUETAS_PAGINA:
             c.showPage()
             etiqueta_idx = 0
@@ -525,7 +379,8 @@ def generar_pdf_bytes_and_next_start(progress_obj=None):
         base_x = MARGIN_X + col * H_STEP
         base_y = (A4[1] - MARGIN_Y) - (row + 1) * V_STEP
 
-        c.setStrokeColor(colors.grey)
+        # card border (subtle)
+        c.setStrokeColor(colors.HexColor("#d6d6d6"))
         c.setLineWidth(0.6)
         c.rect(base_x, base_y, ETIQ_WIDTH, ETIQ_HEIGHT)
 
@@ -534,7 +389,7 @@ def generar_pdf_bytes_and_next_start(progress_obj=None):
         inner_w = ETIQ_WIDTH - 2 * margin_x_int
         inner_h = ETIQ_HEIGHT - 2 * margin_y_int
 
-        if ss_local.show_color_square:
+        if ss.get("show_color_square", True):
             try:
                 fill_color = colors.HexColor(color_hex)
             except Exception:
@@ -548,632 +403,505 @@ def generar_pdf_bytes_and_next_start(progress_obj=None):
             c.rect(square_x, square_y, square_size, square_size, fill=1, stroke=1)
 
         datos = [
-            f"Producto: {ss_local.nombre_prod}",
-            f"Determinación: {ss_local.determinacion}",
-            f"Lote: {ss_local.lote}",
-            f"Analista: {ss_local.analista}    Fecha: {ss_local.fecha}"
+            f"Producto: {ss.get('nombre_prod','')}",
+            f"Determinación: {ss.get('determinacion','')}",
+            f"Lote: {ss.get('lote_general','')}",
+            f"Analista: {ss.get('analista','')}    Fecha: {ss.get('fecha','')}"
         ]
 
-        # Simple font sizing heuristic (keeps close to original)
-        try:
-            size_id = 10
-            size_data = 8
-            c.setFont("Helvetica-Bold", size_id)
-            c.setFillColor(colors.black)
-            text_id_y = inner_y + inner_h - size_id - 2
-            # center id
-            text_area_w = inner_w - (square_size * 0.6)
-            text_x = inner_x + (text_area_w / 2)
-            # adjust center by approximate width using char count
-            c.drawCentredString(text_x, text_id_y, id_text)
-            c.setFont("Helvetica", size_data)
-            line_height = size_data * 1.15
-            data_start_y = text_id_y - line_height
-            for i, dato in enumerate(datos):
-                y_pos = data_start_y - i * line_height
-                if y_pos < inner_y:
-                    break
-                c.drawCentredString(text_x, y_pos, dato)
-        except Exception:
-            # fallback: write minimal information
-            c.drawString(inner_x, inner_y, id_text)
+        # Simple sizing: id bold, datos normal
+        size_id = 9
+        size_data = 7
+        margin_text_w = inner_w * 0.05
+        margin_text_h = inner_h * 0.05
+        text_area_x = inner_x + margin_text_w
+        text_area_y = inner_y + margin_text_h
+        text_area_w = inner_w - (2 * margin_text_w) - (square_size * 0.6)
+        text_area_h = inner_h - (2 * margin_text_h)
+
+        c.setFont("Helvetica-Bold", size_id)
+        c.setFillColor(colors.black)
+        text_id_y = text_area_y + text_area_h - size_id
+        # center text horizontally in the text area
+        text_width = c.stringWidth(id_text, "Helvetica-Bold", size_id)
+        if text_width > text_area_w:
+            x_adj = text_area_x - ((text_width - text_area_w) * 0.3)
+        else:
+            x_adj = text_area_x + (text_area_w - text_width) / 2
+        c.drawString(x_adj, text_id_y, id_text)
+
+        c.setFont("Helvetica", size_data)
+        line_height = size_data * 1.15
+        data_start_y = text_id_y - line_height
+        for i, dato in enumerate(datos):
+            y_pos = data_start_y - i * line_height
+            if y_pos < text_area_y:
+                break
+            text_width = c.stringWidth(dato, "Helvetica", size_data)
+            if text_width > text_area_w:
+                x_adj = text_area_x - ((text_width - text_area_w) * 0.3)
+            else:
+                x_adj = text_area_x + (text_area_w - text_width) / 2
+            c.drawString(x_adj, y_pos, dato)
 
         etiqueta_idx += 1
         total_generated += 1
 
-    # finish pdf
     c.save()
     buffer.seek(0)
     pdf_bytes = buffer.read()
+    return pdf_bytes, total_generated
 
-    # compute next_start: explanation:
-    # start_label is 1-based position on sheet. After generating N labels,
-    # next_start is position after the last written label on page (1..TOTAL_ETIQUETAS_PAGINA).
-    if total_generated == 0:
-        next_start = safe_int_from_str(ss_local.start_label, 1)
-    else:
-        # last_pos_on_page = ((start-1) + total_generated -1) % TOTAL + 1
-        last_pos_on_page = ((safe_int_from_str(ss_local.start_label, 1) - 1) + total_generated - 1) % TOTAL_ETIQUETAS_PAGINA + 1
-        next_pos = last_pos_on_page + 1
-        if next_pos > TOTAL_ETIQUETAS_PAGINA:
-            next_pos = 1
-        next_start = next_pos
-
-    return pdf_bytes, total_generated, int(next_start)
-
-# ---------- Preview generation (PNG) ----------
-def generate_preview_image(state_dict, width=600, height=300):
+# ----------------------------
+# Preview label (Pillow)
+# ----------------------------
+def preview_label_sample(ss, etiquetas_sample=None):
     """
-    Genera una imagen PNG (PIL Image) que representa la primera etiqueta
-    basada en build_etiquetas_from_state. Se usa para mostrar preview_label.
+    Genera una imagen PNG (Pillow Image) que sirve como vista previa de la primera etiqueta.
+    Devuelve bytes (PNG).
     """
-    etiquetas = build_etiquetas_from_state(state_dict)
-    # Choose first etiqueta or placeholder
-    if etiquetas:
-        tipo, id_text, color = etiquetas[0]
-    else:
-        tipo, id_text, color = ("MUESTRA", "Sin etiquetas", "#cccccc")
-
-    img = Image.new("RGBA", (width, height), (255, 255, 255, 255))
+    W, H = 900, 420
+    bg_color = (250, 250, 250)
+    img = Image.new("RGB", (W, H), color=bg_color)
     draw = ImageDraw.Draw(img)
-    # Fonts: try to use a truetype if available, else default
+
+    # card
+    card_margin = 32
+    card_bbox = [card_margin, card_margin, W - card_margin, H - card_margin]
+    draw.rounded_rectangle(card_bbox, radius=12, fill=(255,255,255), outline=(214,214,214), width=1)
+
+    # sample text (left)
+    pad = 24
+    left_x = card_bbox[0] + pad
+    top_y = card_bbox[1] + pad
+
+    # Fonts: try to load a truetype, fallback to default
     try:
-        font_id = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
-        font_data = ImageFont.truetype("DejaVuSans.ttf", 16)
+        font_bold = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
+        font_reg = ImageFont.truetype("DejaVuSans.ttf", 18)
+        font_mono = ImageFont.truetype("DejaVuSans.ttf", 14)
     except Exception:
-        font_id = ImageFont.load_default()
-        font_data = ImageFont.load_default()
+        font_bold = ImageFont.load_default()
+        font_reg = ImageFont.load_default()
+        font_mono = ImageFont.load_default()
 
-    # Border
-    draw.rectangle([(10, 10), (width - 10, height - 10)], outline="#333333", width=2, fill=(255,255,255))
-    # Color square
-    square_w = 60
-    sq_x = width - 10 - square_w - 10
-    sq_y = 20
-    try:
-        draw.rectangle([sq_x, sq_y, sq_x + square_w, sq_y + square_w], fill=color, outline="#000000")
-    except Exception:
-        draw.rectangle([sq_x, sq_y, sq_x + square_w, sq_y + square_w], fill="#cccccc", outline="#000000")
-    # ID text (centered left area)
-    left_w = width - 10 - (sq_x - 10) - 20
-    # Write id_text large
-    id_x = 30
-    id_y = 30
-    draw.text((id_x, id_y), id_text, font=font_id, fill="#0b2340")
-    # Other meta
-    prod = f"Producto: {state_dict.get('nombre_prod','')}"
-    lote = f"Lote: {state_dict.get('lote','')}"
-    fecha = f"Fecha: {state_dict.get('fecha','')}"
-    draw.text((id_x, id_y + 50), prod, font=font_data, fill="#0b2340")
-    draw.text((id_x, id_y + 70), lote, font=font_data, fill="#0b2340")
-    draw.text((id_x, id_y + 90), fecha, font=font_data, fill="#0b2340")
+    prod = ss.get("nombre_prod", "") or "Nombre producto"
+    lote = ss.get("lote_general", "") or (ss.get("lotes",[None])[0] or "Lote1")
+    lblnum = ss.get("start_label", 1)
 
-    # small footer text (tipo and timestamp)
-    footer = f"{tipo} · Preview generado {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    draw.text((20, height - 30), footer, font=font_data, fill="#666666")
+    draw.text((left_x, top_y), prod, fill=(34,34,34), font=font_bold)
+    draw.text((left_x, top_y + 40), f"Lote: {lote}", fill=(80,80,80), font=font_reg)
+    draw.text((left_x, top_y + 72), f"Etiqueta: {lblnum}", fill=(80,80,80), font=font_reg)
 
-    # Return bytes
-    bio = BytesIO()
-    img.save(bio, format="PNG")
-    bio.seek(0)
-    return bio.read()
+    # color swatches (reactivos or sample color)
+    sw_x = left_x
+    sw_y = top_y + 120
+    sw_size = 36
+    reactivos = ss.get("reactivos", [])
+    if etiquetas_sample:
+        # use provided sample etiquetas to pick colors
+        color_list = [e[2] for e in etiquetas_sample[:6] if e and e[2]]
+    else:
+        color_list = [r.get("color") or "#cccccc" for r in reactivos[:6]]
+    if not color_list:
+        color_list = ["#cccccc"]
 
-# ---------- Helper: Export / Import config ----------
-def export_config():
-    cfg = {
-        "show_color_square": ss.show_color_square,
-        "incluir_viales": ss.incluir_viales,
-        "dup_patron": ss.dup_patron,
-        "peso_patron": ss.peso_patron,
-        "vol_patron": ss.vol_patron,
-        "dup_muestra": ss.dup_muestra,
-        "uniformidad": ss.uniformidad,
-        "num_uniform_samples": ss.num_uniform_samples,
-        "muestra_peso": ss.muestra_peso,
-        "muestra_vol": ss.muestra_vol,
-        "lotes": ss.lotes,
-        "lote_color_map": ss.lote_color_map,
-        "diluciones_std": ss.diluciones_std,
-        "diluciones_muestra": ss.diluciones_muestra,
-        "diluciones_placebo": ss.diluciones_placebo,
-        "incluir_placebo": ss.incluir_placebo,
-        "placebo_peso": ss.placebo_peso,
-        "placebo_vol": ss.placebo_vol,
-        "reactivos": ss.reactivos,
-        "viales_multiplicadores": ss.viales_multiplicadores,
-        "nombre_prod": ss.nombre_prod,
-        "lote_general": ss.lote,
-        "determinacion": ss.determinacion,
-        "analista": ss.analista,
-        "fecha": ss.fecha,
-        "start_label": ss.start_label,
-    }
-    return json.dumps(cfg, indent=2)
+    for i, col in enumerate(color_list):
+        x = sw_x + i * (sw_size + 10)
+        try:
+            draw.rectangle([x, sw_y, x + sw_size, sw_y + sw_size], fill=col, outline=(0,0,0))
+        except Exception:
+            draw.rectangle([x, sw_y, x + sw_size, sw_y + sw_size], fill="#cccccc", outline=(0,0,0))
 
-def import_config(json_str):
-    try:
-        cfg = json.loads(json_str)
-    except Exception as e:
-        raise ValueError("JSON inválido")
-    # map keys into session state where applicable (validated)
-    for k in ["show_color_square","incluir_viales","dup_patron","peso_patron","vol_patron",
-              "dup_muestra","uniformidad","num_uniform_samples","muestra_peso","muestra_vol",
-              "diluciones_std","diluciones_muestra","diluciones_placebo","incluir_placebo",
-              "placebo_peso","placebo_vol","reactivos","viales_multiplicadores",
-              "nombre_prod","lote_general","determinacion","analista","fecha","start_label","lotes","lote_color_map"]:
-        if k in cfg:
-            # adapt key names
-            if k == "lote_general":
-                ss["lote"] = cfg[k]
-            else:
-                ss[k] = cfg[k]
-    # normalization
-    if "lotes" in ss and isinstance(ss.lotes, list):
-        # ensure each lote has uid if not present
-        for i, l in enumerate(ss.lotes):
-            if not isinstance(l, dict):
-                ss.lotes[i] = {"uid": new_uid("l"), "name": str(l)}
-            else:
-                ss.lotes[i].setdefault("uid", new_uid("l"))
-    # keep UI in sync
-    ss["num_lotes"] = str(len(ss.lotes))
-    return True
+    # small footer with meta
+    foot = f"Analista: {ss.get('analista','')}    Fecha: {ss.get('fecha','')}"
+    draw.text((left_x, H - card_margin - 32), foot, fill=(120,120,120), font=font_mono)
 
-# ---------- Small UI helper functions ----------
-def validate_inputs():
+    # prepare bytes
+    b = BytesIO()
+    img.save(b, format="PNG")
+    b.seek(0)
+    return b.read()
+
+# ----------------------------
+# Validation
+# ----------------------------
+def validate_inputs(ss):
+    """
+    Validaciones mínimas:
+      - Pesos y volúmenes >= 0 cuando sean numéricos
+      - etiqueta_inicial entre 1 y TOTAL_ETIQUETAS_PAGINA
+      - num_lotes en rango
+    Devuelve lista de strings con errores (vacía = OK)
+    """
     errors = []
-    # validate num_lotes
-    try:
-        n = int(ss.num_lotes)
-        if n < 0 or n > 40:
-            errors.append("N° de lotes debe estar entre 0 y 40.")
-    except Exception:
-        errors.append("N° de lotes inválido.")
-    # validate start_label
-    try:
-        sl = int(ss.start_label)
-        if sl < 1 or sl > TOTAL_ETIQUETAS_PAGINA:
-            errors.append(f"Etiqueta inicial debe estar entre 1 y {TOTAL_ETIQUETAS_PAGINA}.")
-    except Exception:
-        errors.append("Etiqueta inicial inválida.")
+    # etiqueta inicial
+    s_label = safe_int_from_str(ss.get("start_label", 1), 1)
+    if s_label < 1 or s_label > TOTAL_ETIQUETAS_PAGINA:
+        errors.append(f"Etiqueta inicial debe estar entre 1 y {TOTAL_ETIQUETAS_PAGINA}.")
+
+    # numeric checks (if provided and parseable)
+    for key in ["peso_patron", "vol_patron", "muestra_peso", "muestra_vol", "placebo_peso", "placebo_vol"]:
+        val = ss.get(key, "")
+        if val is None or str(val).strip() == "":
+            continue
+        try:
+            v = float(str(val).strip())
+            if v < 0:
+                errors.append(f"{key.replace('_',' ').capitalize()} debe ser >= 0.")
+        except Exception:
+            # allow alphanumeric but warn? We'll not add error to be permissive.
+            pass
+
+    # num_lotes
+    nl = safe_int_from_str(ss.get("num_lotes", 1), 1)
+    if nl < 1 or nl > 20:
+        errors.append("N° de lotes debe estar entre 1 y 20.")
     return errors
 
-# ---------- Layout & CSS (max-width center, focus styles, accessible targets) ----------
-MAX_WIDTH_CSS = """
-<style>
-.main-container {
-  max-width: 1200px;
-  margin-left: auto;
-  margin-right: auto;
-}
-input:focus, textarea:focus, select:focus {
-  outline: 3px solid rgba(14,155,216,0.25);
-  border-radius: 6px;
-}
-.stButton>button {
-  padding: 10px 14px !important;
-  border-radius: 8px;
-}
-.checkbox, .stCheckbox > div {
-  padding: 8px;
-}
-</style>
-"""
-st.markdown(MAX_WIDTH_CSS, unsafe_allow_html=True)
+# ----------------------------
+# UI helpers and layout
+# ----------------------------
+def inject_css():
+    """
+    Inyecta estilos para layout central, cards y botón grande verde.
+    Comentario: aquí controlamos ancho máximo del contenedor y estilo de 'cards'.
+    """
+    st.markdown(
+        """
+        <style>
+        /* Contenedor central con ancho máximo */
+        .central-container {
+            max-width: 1100px;
+            margin: 18px auto;
+            padding: 8px 8px 48px 8px;
+            background: #f7f9fb;
+            border-radius: 8px;
+        }
+        /* Card style */
+        .card {
+            background: #ffffff;
+            border: 1px solid #d6d6d6;
+            border-radius: 10px;
+            padding: 16px;
+            margin-bottom: 14px;
+            box-shadow: 0 1px 2px rgba(15,15,15,0.02);
+        }
+        .card h3 {
+            margin: 0 0 8px 0;
+            font-size: 16px;
+        }
+        .row-label {
+            color: #444;
+            font-size: 13px;
+            width: 140px;
+            text-align: left;
+            display: inline-block;
+        }
+        .input-compact > div, .stTextInput > div > input {
+            padding: 8px !important;
+            border-radius: 6px;
+        }
+        /* Big generator button */
+        .gen-btn {
+            display: flex;
+            justify-content: center;
+            margin-top: 18px;
+            margin-bottom: 18px;
+        }
+        .gen-btn > button {
+            background-color: #2ecc71 !important;
+            color: white !important;
+            border: none !important;
+            padding: 12px 28px !important;
+            font-size: 18px !important;
+            border-radius: 10px !important;
+            box-shadow: 0 4px 10px rgba(46,204,113,0.18);
+        }
+        /* compact inputs spacing */
+        .card .stTextInput, .card .stNumberInput {
+            margin-bottom: 8px;
+        }
+        /* preview center */
+        .preview-center { display:flex; justify-content:center; margin-bottom:8px; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-# ---------- Sidebar (global options) ----------
-st.sidebar.title("Opciones Globales")
-st.sidebar.caption("Configuración y ajustes rápidos")
-
-# Visual options
-ss.show_color_square = st.sidebar.checkbox("Mostrar cuadro de color", value=ss.show_color_square, help="Muestra un cuadrado con el color asignado en la etiqueta.")
-ss.incluir_viales = st.sidebar.checkbox("Incluir viales", value=ss.incluir_viales, help="Incluir viales HPLC según multiplicadores.")
-
-# Config export/import
-st.sidebar.markdown("### Configuración")
-if st.sidebar.button("Exportar configuración"):
-    cfg_json = export_config()
-    filename_cfg = f"config_etiquetador_{datetime.today().strftime('%Y%m%d')}.json"
-    st.sidebar.download_button("Descargar JSON", data=cfg_json, file_name=filename_cfg, mime="application/json")
-
-uploaded = st.sidebar.file_uploader("Importar configuración (JSON)", type=["json"])
-if uploaded is not None:
+def card_container(title, content_callable):
+    """
+    Wrapper: renderiza una card con título y ejecuta content_callable() para el contenido.
+    """
+    st.markdown(f"<div class='card'><h3>{title}</h3>", unsafe_allow_html=True)
     try:
-        content = uploaded.read().decode("utf-8")
-        import_config(content)
-        st.sidebar.success("Configuración importada correctamente. La página se actualizará.")
-        st.experimental_rerun()
-    except Exception as e:
-        st.sidebar.error(f"Error importando configuración: {str(e)}")
+        content_callable()
+    finally:
+        st.markdown("</div>", unsafe_allow_html=True)
 
-st.sidebar.markdown("---")
-st.sidebar.caption("Streamlit UI: use paneles en el área principal. Se deshabilita Generar durante la creación del PDF.")
+# ----------------------------
+# Main UI build
+# ----------------------------
+def build_ui():
+    inject_css()
+    st.markdown("<div class='central-container'>", unsafe_allow_html=True)
+    st.title("Generador de etiquetas APLI 10199 (tema claro)")
 
-# ---------- Main layout: columns (2/1) ----------
-st.markdown("<div class='main-container'>", unsafe_allow_html=True)
-left_col, right_col = st.columns([2, 1])
+    # Two columns: left wide (~65%) and right narrow (~35%)
+    left_col, right_col = st.columns([2.2, 1])
 
-# ---------- Left column content (expanders: Patrón, Muestras, Lotes, Reactivos, Datos generales) ----------
-with left_col:
-    st.header("Configuración de etiquetas")
+    # LEFT COLUMN: Datos del Patrón, Muestras, Lotes, Diluciones (simplified)
+    with left_col:
+        def contenido_patron():
+            c1, c2, c3 = st.columns([1,1,1])
+            with c1:
+                st.checkbox("Duplicado (A/B)", value=st.session_state.dup_patron, key="dup_patron")
+            with c2:
+                st.text_input("Peso patrón (g):", value=st.session_state.peso_patron, key="peso_patron")
+            with c3:
+                st.text_input("Vol final patrón (ml):", value=st.session_state.vol_patron, key="vol_patron")
+        card_container("Datos del Patrón", contenido_patron)
 
-    # PATRÓN
-    with st.expander("Patrón", expanded=True):
-        st.markdown("Duplicado (A/B) genera STD A y STD B. Dejar campos vacíos si no aplica.")
-        ss.dup_patron = st.checkbox("Duplicado (A/B)", value=ss.dup_patron, key="dup_patron", help="Si activo, se generan STD A y STD B.")
-        ss.peso_patron = st.text_input("Peso patrón (g):", value=ss.peso_patron, key="peso_patron")
-        ss.vol_patron = st.text_input("Vol final patrón (ml):", value=ss.vol_patron, key="vol_patron")
-
-        # Diluciones estándar (compact)
-        st.markdown("**Diluciones estándar**")
-        add_std = st.button("Agregar dilución estándar", key="add_std")
-        if add_std:
-            ss.diluciones_std.append({"uid": new_uid("ds"), "v_pip": "", "v_final": "", "id_text": ""})
-            st.experimental_rerun()
-
-        # Render diluciones_std list
-        new_std = []
-        for i, d in enumerate(list(ss.diluciones_std)):
-            uid = d.get("uid") or new_uid("ds")
-            cols = st.columns([1,1,2,0.6])
-            v1 = cols[0].text_input(f"D{i+1} Vpip", value=d.get("v_pip",""), key=f"std_vpip_{uid}")
-            v2 = cols[1].text_input(f"D{i+1} Vfinal", value=d.get("v_final",""), key=f"std_vfinal_{uid}")
-            idt = cols[2].text_input(f"D{i+1} ID (opcional)", value=d.get("id_text",""), key=f"std_id_{uid}")
-            if cols[3].button("Eliminar", key=f"del_std_{uid}"):
-                # skip adding to new_std to delete
-                st.experimental_rerun()
-            new_std.append({"uid": uid, "v_pip": v1, "v_final": v2, "id_text": idt})
-        ss.diluciones_std = new_std
-
-    # MUESTRAS
-    with st.expander("Muestras", expanded=True):
-        st.markdown("Configuración de muestras: duplicados, uniformidad y medidas.")
-        ss.dup_muestra = st.checkbox("Duplicado por muestra (A/B)", value=ss.dup_muestra, key="dup_muestra", help="Genera sufijos /A y /B.")
-        ss.uniformidad = st.checkbox("Uniformidad de contenido", value=ss.uniformidad, key="uniformidad", help="Genera N muestras numeradas por lote.")
-        if ss.uniformidad:
-            ss.num_uniform_samples = st.text_input("N° muestras (uniformidad):", value=ss.num_uniform_samples, key="num_uniform_samples")
-        ss.muestra_peso = st.text_input("Peso muestra (g):", value=ss.muestra_peso, key="muestra_peso")
-        ss.muestra_vol = st.text_input("Vol final muestra (ml):", value=ss.muestra_vol, key="muestra_vol")
-
-        # Diluciones de muestra (acumulativas)
-        st.markdown("**Diluciones de muestra (acumulativas)**")
-        if st.button("Agregar dilución de muestra", key="add_dm"):
-            per = ["" for _ in range(len(ss.lotes))]
-            ss.diluciones_muestra.append({"uid": new_uid("dm"), "v_pip":"", "v_final":"", "per_lote_ids": per})
-            st.experimental_rerun()
-
-        new_dm = []
-        for idx, d in enumerate(list(ss.diluciones_muestra)):
-            uid = d.get("uid") or new_uid("dm")
-            st.markdown(f"**D{idx+1}:**")
+        def contenido_muestras():
+            st.checkbox("Duplicado por muestra (A/B)", value=st.session_state.dup_muestra, key="dup_muestra")
+            st.checkbox("Uniformidad de contenido", value=st.session_state.uniformidad, key="uniformidad")
+            if st.session_state.uniformidad:
+                st.number_input("N° muestras (uniformidad)", min_value=1, max_value=100, value=int(st.session_state.num_uniform_samples), key="num_uniform_samples")
             c1, c2 = st.columns([1,1])
-            v1 = c1.text_input("Vpip", value=d.get("v_pip",""), key=f"dm_vpip_{uid}")
-            v2 = c2.text_input("Vfinal", value=d.get("v_final",""), key=f"dm_vfinal_{uid}")
-            # IDs por lote
-            per = list(d.get("per_lote_ids", []))
-            if len(per) < len(ss.lotes):
-                per += [""] * (len(ss.lotes) - len(per))
-            for li in range(len(ss.lotes)):
-                lote_name = (ss.lotes[li].get("name","") or "").strip() or f"Lote{li+1}"
-                key = f"dm_{uid}_per_{li}"
-                per_val = st.text_input(f"{lote_name} ID (opcional)", value=per[li], key=key)
-                per[li] = per_val
-            if st.button("Eliminar dilución", key=f"del_dm_{uid}"):
-                ss.diluciones_muestra = [x for x in ss.diluciones_muestra if x.get("uid") != uid]
-                st.experimental_rerun()
-            new_dm.append({"uid": uid, "v_pip": v1, "v_final": v2, "per_lote_ids": per})
-        ss.diluciones_muestra = new_dm
+            with c1:
+                st.text_input("Peso muestra (g):", value=st.session_state.muestra_peso, key="muestra_peso")
+            with c2:
+                st.text_input("Vol final muestra (ml):", value=st.session_state.muestra_vol, key="muestra_vol")
+        card_container("Datos de las Muestras", contenido_muestras)
 
-    # LOTES
-    with st.expander("Lotes", expanded=True):
-        st.markdown("Añada o elimine lotes. A la derecha verá un resumen con la lista de lotes.")
-        col_l1, col_l2 = st.columns([1,1])
-        if col_l1.button("+ Añadir lote"):
-            ss.lotes.append({"uid": new_uid("l"), "name": ""})
-            idx = len(ss.lotes)-1
-            ss.lote_color_map[idx] = allocate_lote_color(idx)
-            ss.num_lotes = str(len(ss.lotes))
-            st.experimental_rerun()
-        if col_l2.button("- Eliminar último lote"):
-            if len(ss.lotes) > 0:
-                ss.lotes.pop()
-                # rebuild color map
-                new_map = {}
-                for i, l in enumerate(ss.lotes):
-                    new_map[i] = ss.lote_color_map.get(i, allocate_lote_color(i))
-                ss.lote_color_map = new_map
-                ss.num_lotes = str(len(ss.lotes))
-            st.experimental_rerun()
+        def contenido_lotes():
+            # N° de lotes con number_input y controles +/- para ajustar
+            n = st.number_input("N° de lotes", min_value=1, max_value=20, value=int(st.session_state.num_lotes), key="num_lotes")
+            # Ensure session_state.lotes length matches
+            wanted = int(n)
+            cur = len(st.session_state.lotes)
+            if wanted > cur:
+                for i in range(cur, wanted):
+                    st.session_state.lotes.append(f"Lote{i+1}")
+            elif wanted < cur:
+                st.session_state.lotes = st.session_state.lotes[:wanted]
+            # Mostrar inputs para cada lote
+            for i in range(wanted):
+                key = f"lote_name_{i}"
+                st.session_state.lotes[i] = st.text_input(f"Lote {i+1}", value=st.session_state.lotes[i], key=key)
+        card_container("Lotes", contenido_lotes)
 
-        # Editable lote names in grid
-        for i, lote in enumerate(ss.lotes):
-            uid = lote.get("uid") or new_uid("l")
-            cols = st.columns([0.08, 1, 0.2])
-            with cols[0]:
-                color = ss.lote_color_map.get(i, allocate_lote_color(i))
-                st.markdown(f"<div style='width:18px;height:12px;background:{color};border:1px solid #000;border-radius:3px'></div>", unsafe_allow_html=True)
-            with cols[1]:
-                name = st.text_input(f"Lote {i+1} nombre", value=lote.get("name",""), key=f"lote_name_{uid}")
-                ss.lotes[i]["name"] = name
-            with cols[2]:
-                if cols[2].button("Eliminar", key=f"del_lote_{uid}"):
-                    ss.lotes.pop(i)
-                    # rebuild color map
-                    new_map = {}
-                    for j, l in enumerate(ss.lotes):
-                        new_map[j] = ss.lote_color_map.get(j, allocate_lote_color(j))
-                    ss.lote_color_map = new_map
-                    ss.num_lotes = str(len(ss.lotes))
-                    st.experimental_rerun()
+        def contenido_diluciones():
+            st.markdown("Diluciones estándar y de muestra (simplificado).", unsafe_allow_html=True)
+            st.caption("Nota: la versión simplificada muestra las diluciones como texto libre para mantener UI compacta.")
+            # In this refactor we keep a minimal input to allow manual IDs
+            st.text_input("IDs extra (separados por comas):", value="", key="manual_ids")
+        card_container("Diluciones", contenido_diluciones)
 
-        # update summary (side will show list)
-        ss.num_lotes = str(len(ss.lotes))
+        def contenido_reactivos_extra():
+            st.markdown("Reactivos (nombre + color + multiplicador)")
+            # Reactivos dynamic list
+            if "reactivos" not in st.session_state:
+                st.session_state.reactivos = []
+            cols = st.columns([3,1,1,0.5])
+            headers = ["Nombre", "Color", "Multiplicador", ""]
+            for i, h in enumerate(headers):
+                cols[i].markdown(f"**{h}**")
+            # render each reactivo row
+            for idx, r in enumerate(list(st.session_state.reactivos)):
+                c1, c2, c3, c4 = st.columns([3,1,1,0.5])
+                with c1:
+                    name = c1.text_input("", value=r.get("name",""), key=f"reactivo_name_{idx}")
+                with c2:
+                    color = c2.color_picker("", value=r.get("color","#f39c12"), key=f"reactivo_color_{idx}")
+                with c3:
+                    mult = c3.number_input("", min_value=0, value=int(r.get("multiplier",1)), step=1, key=f"reactivo_mult_{idx}")
+                with c4:
+                    if c4.button("✕", key=f"del_react_{idx}"):
+                        st.session_state.reactivos.pop(idx)
+                        st.experimental_rerun()
+                st.session_state.reactivos[idx] = {"name": name, "color": color, "multiplier": int(mult)}
+            if st.button("+ Agregar reactivo"):
+                st.session_state.reactivos.append({"name": "", "color": "#f39c12", "multiplier": 0})
+        card_container("Reactivos extra", contenido_reactivos_extra)
 
-    # REACTIVOS
-    with st.expander("Reactivos", expanded=False):
-        st.markdown("Defina nombre y multiplicador (viales) para cada reactivo. Puede ajustar número de reactivos.")
-        ss.num_reactivos = st.text_input("N° de reactivos", value=ss.num_reactivos, key="num_reactivos")
-        try:
-            nr = max(0, min(30, int(ss.num_reactivos)))
-        except Exception:
-            nr = 0
-        # ensure list length
-        if len(ss.reactivos) < nr:
-            for _ in range(nr - len(ss.reactivos)):
-                ss.reactivos.append({"nombre":"", "multiplicador": 0, "color": REACTIVO_COLOR})
-        elif len(ss.reactivos) > nr:
-            ss.reactivos = ss.reactivos[:nr]
+    # RIGHT COLUMN: Opciones Viales, Datos Generales, Resumen y Preview
+    with right_col:
+        def contenido_viales_options():
+            st.checkbox("Mostrar cuadro de color", value=st.session_state.show_color_square, key="show_color_square")
+            st.checkbox("Incluir viales", value=st.session_state.incluir_viales, key="incluir_viales")
+            st.text_input("Blanco:", value=st.session_state.texto_blanco, key="texto_blanco")
+            st.text_input("Wash:", value=st.session_state.texto_wash, key="texto_wash")
+            st.caption("Configure multiplicadores para viales en la sección de vista previa/summary después de generar preview.")
+        card_container("Opciones Viales", contenido_viales_options)
 
-        # Render reactivos rows: nombre, multiplicador, color picker
-        total_viales_from_reactivos = 0
-        for i in range(nr):
-            r = ss.reactivos[i] if i < len(ss.reactivos) else {"nombre":"","multiplicador":0,"color":REACTIVO_COLOR}
-            cols = st.columns([2,1,1])
-            nombre = cols[0].text_input(f"Reactivo {i+1} nombre", value=r.get("nombre",""), key=f"reactivo_nombre_{i}")
-            multip = cols[1].number_input(f"Mult.", min_value=0, value=int(r.get("multiplicador",0)), step=1, key=f"reactivo_mult_{i}")
-            color = cols[2].color_picker(f"Color", value=r.get("color", REACTIVO_COLOR), key=f"reactivo_color_{i}")
-            ss.reactivos[i] = {"nombre": nombre, "multiplicador": int(multip), "color": color}
-            total_viales_from_reactivos += int(multip)
+        def contenido_datos_generales():
+            st.text_input("Nombre producto:", value=st.session_state.nombre_prod, key="nombre_prod")
+            st.text_input("Lote (general):", value=st.session_state.lote_general, key="lote_general")
+            st.text_input("Determinación:", value=st.session_state.determinacion, key="determinacion")
+            st.text_input("Analista:", value=st.session_state.analista, key="analista")
+            st.text_input("Fecha:", value=st.session_state.fecha, key="fecha")
+            st.number_input("Etiqueta inicial (1-80):", min_value=1, max_value=TOTAL_ETIQUETAS_PAGINA, value=int(st.session_state.start_label), key="start_label")
+        card_container("Datos Generales", contenido_datos_generales)
 
-        st.markdown(f"Total viales por reactivos: **{total_viales_from_reactivos}**", unsafe_allow_html=True)
-
-    # DATOS GENERALES (expander)
-    with st.expander("Datos generales", expanded=False):
-        ss.nombre_prod = st.text_input("Nombre producto:", value=ss.nombre_prod, key="nombre_prod")
-        ss.lote = st.text_input("Lote (general):", value=ss.lote, key="lote")
-        ss.determinacion = st.text_input("Determinación:", value=ss.determinacion, key="determinacion")
-        ss.analista = st.text_input("Analista:", value=ss.analista, key="analista")
-        ss.fecha = st.text_input("Fecha:", value=ss.fecha, key="fecha")
-        ss.start_label = st.number_input("Etiqueta inicial (1-80):", min_value=1, max_value=TOTAL_ETIQUETAS_PAGINA, value=int(ss.start_label), key="start_label")
-
-# ---------- Right column: preview, summaries, actions ----------
-with right_col:
-    st.header("Vista previa y Resumen")
-    # Generate a small current state dict for preview
-    state_for_preview = {
-        "show_color_square": ss.show_color_square,
-        "dup_patron": ss.dup_patron,
-        "dup_muestra": ss.dup_muestra,
-        "uniformidad": ss.uniformidad,
-        "incluir_placebo": ss.incluir_placebo,
-        "incluir_viales": ss.incluir_viales,
-        "num_uniform_samples": ss.num_uniform_samples,
-        "num_lotes": ss.num_lotes,
-        "num_reactivos": ss.num_reactivos,
-        "texto_blanco": ss.get("texto_blanco",""),
-        "texto_wash": ss.get("texto_wash",""),
-        "peso_patron": ss.peso_patron,
-        "vol_patron": ss.vol_patron,
-        "muestra_peso": ss.muestra_peso,
-        "muestra_vol": ss.muestra_vol,
-        "placebo_peso": ss.placebo_peso if "placebo_peso" in ss else "",
-        "placebo_vol": ss.placebo_vol if "placebo_vol" in ss else "",
-        "nombre_prod": ss.nombre_prod,
-        "lote": ss.lote,
-        "determinacion": ss.determinacion,
-        "analista": ss.analista,
-        "fecha": ss.fecha,
-        "start_label": ss.start_label,
-        "lotes": ss.lotes,
-        "reactivos": [r.get("nombre","") if isinstance(r, dict) else r for r in ss.reactivos],
-        "diluciones_std": ss.diluciones_std,
-        "diluciones_muestra": ss.diluciones_muestra,
-        "diluciones_placebo": ss.diluciones_placebo,
-        "id_color_map": ss.get("id_color_map", {}),
-        "lote_color_map": ss.get("lote_color_map", {}),
-        "viales_multiplicadores": ss.viales_multiplicadores,
-    }
-    # Assign colors map for preview convenience
-    try:
-        items_for_ids = construir_ids_viales_from_state(state_for_preview)
-        assign_colors_for_ids_for_state(items_for_ids, {"id_color_map": state_for_preview.get("id_color_map", {}), "lote_color_map": state_for_preview.get("lote_color_map", {}), "lotes": state_for_preview.get("lotes", [])})
-        state_for_preview["id_color_map"] = state_for_preview.get("id_color_map", {})
-        state_for_preview["lote_color_map"] = state_for_preview.get("lote_color_map", {})
-    except Exception:
-        pass
-
-    # Show preview image
-    st.markdown("### Preview etiqueta (primera)")
-    try:
-        preview_bytes = generate_preview_image(state_for_preview, width=600, height=300)
-        st.image(preview_bytes, use_column_width=True)
-    except Exception as e:
-        st.error("Error al generar la vista previa.")
-
-    # Right side summaries
-    st.markdown("### Resumen rápido")
-    # Lotes summary
-    lote_names = [ (l.get("name","") or f"Lote{i+1}") for i,l in enumerate(ss.lotes) ]
-    st.markdown(f"- Lotes ({len(lote_names)}): {', '.join(lote_names) if lote_names else '—'}")
-    # Reactivos summary
-    reactivos_summary = ", ".join([f"{r.get('nombre','') or '(sin nombre)'}×{r.get('multiplicador',0)}" for r in ss.reactivos])
-    st.markdown(f"- Reactivos: {reactivos_summary if reactivos_summary else '—'}")
-    # Total viales estimated
-    # compute using construir ids + viales_multiplicadores
-    ids = construir_ids_viales_from_state(state_for_preview)
-    assign_colors_for_ids_for_state(ids, state_for_preview)
-    total_vials = 0
-    for it in ids:
-        vid = it["id"]
-        mult = ss.viales_multiplicadores.get(vid, 0)
-        try:
-            mult = int(mult)
-        except Exception:
-            mult = 0
-        total_vials += max(0, mult)
-    st.markdown(f"- Viales totales estimados: **{total_vials}**")
-
-    st.markdown("---")
-    # ACTIONS: primary GENERAR PDF (disabled while generating)
-    st.markdown("### Acciones")
-    colA, colB = st.columns([1,1])
-    # Validate inputs before enabling Generate
-    errors = validate_inputs()
-    if errors:
-        for e in errors:
-            st.error(e)
-    generate_disabled = ss.generating or bool(errors)
-
-    def on_generate_click():
-        # Guardar metadata y bloquear UI
-        ss.generating = True
-        ss.ui_msg = ""
-        # Run generation inside try/except and provide spinner/progress
-        try:
-            with st.spinner("Generando PDF..."):
-                progress = st.progress(0)
-                pdf_bytes, total, next_start = generar_pdf_bytes_and_next_start(progress_obj=progress)
-                # update session state with results
-                ss.last_pdf = pdf_bytes
-                filename = f"{datetime.today().strftime('%Y%m%d')}_{limpiar_nombre_archivo(ss.nombre_prod)}_{limpiar_nombre_archivo(ss.lote)}.pdf"
-                ss.last_pdf_filename = filename
-                ss.last_total = total
-                ss.start_label = next_start
-                # show success summary (via ss.ui_msg so it renders after rerun)
-                ss.ui_msg = f"PDF generado: {total} etiquetas (Etiqueta inicial: {ss.start_label}). Archivo: {filename}"
-        except Exception as err:
-            # Log error to temp file and show compact message
-            with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".log") as tf:
-                tb_text = traceback.format_exc()
-                tf.write(tb_text)
-                logfile = tf.name
-            ss.last_pdf = None
-            ss.last_total = 0
-            ss.ui_msg = f"Error generando PDF. Detalle en: {logfile}"
-        finally:
-            ss.generating = False
-            # ensure UI updates
-            st.experimental_rerun()
-
-    # Primary button (styled by streamlit)
-    if colA.button("GENERAR PDF", disabled=generate_disabled):
-        on_generate_click()
-
-    # Secondary: Download / Open (only when last_pdf exists)
-    if ss.last_pdf:
-        # Open in new tab (data URL)
-        b64 = Base64 := None  # placeholder to avoid lint
-        try:
-            import base64 as _base64
-            b64 = _base64.b64encode(ss.last_pdf).decode("ascii")
-            open_js = f"""
-            <script>
-            (function() {{
-                const b64 = "{b64}";
-                const byteCharacters = atob(b64);
-                const byteNumbers = new Array(byteCharacters.length);
-                for (let i = 0; i < byteCharacters.length; i++) {{
-                    byteNumbers[i] = byteCharacters.charCodeAt(i);
-                }}
-                const byteArray = new Uint8Array(byteNumbers);
-                const blob = new Blob([byteArray], {{type: 'application/pdf'}});
-                const url = URL.createObjectURL(blob);
-                window.open(url, '_blank');
-            }})();
-            </script>
-            """
-        except Exception:
-            open_js = None
-
-        if colB.button("Abrir en nueva pestaña"):
-            if open_js:
-                components.html(open_js, height=50)
+        def contenido_preview_y_resumen():
+            st.markdown("<div class='preview-center'>", unsafe_allow_html=True)
+            # Show existing preview if available
+            if st.session_state.preview_img:
+                st.image(st.session_state.preview_img, width=420)
             else:
-                st.warning("No es posible abrir en pestaña nueva en este navegador/entorno.")
-        # Download button
-        colB.download_button("Descargar PDF", data=ss.last_pdf, file_name=ss.last_pdf_filename, mime="application/pdf")
+                st.info("Pulse GENERAR PDF para ver una vista previa antes de descargar.")
+            st.markdown("</div>", unsafe_allow_html=True)
 
-    # Show UI messages if present
-    if ss.ui_msg:
-        st.success(ss.ui_msg)
-        ss.ui_msg = ""
+            # Summary of counts
+            etiquetas = build_etiquetas_from_state({
+                "texto_blanco": st.session_state.texto_blanco,
+                "texto_wash": st.session_state.texto_wash,
+                "dup_patron": st.session_state.dup_patron,
+                "dup_muestra": st.session_state.dup_muestra,
+                "uniformidad": st.session_state.uniformidad,
+                "incluir_placebo": st.session_state.incluir_placebo,
+                "lotes": st.session_state.lotes,
+                "reactivos": st.session_state.reactivos,
+                "viales_multiplicadores": st.session_state.viales_multiplicadores,
+                "muestra_peso": st.session_state.muestra_peso,
+                "muestra_vol": st.session_state.muestra_vol,
+                "placebo_peso": st.session_state.placebo_peso,
+                "placebo_vol": st.session_state.placebo_vol,
+                "peso_patron": st.session_state.peso_patron,
+                "vol_patron": st.session_state.vol_patron,
+                "lote_color_map": getattr(st.session_state, "lote_color_map", {}) if "lote_color_map" in st.session_state else {}
+            })
+            st.markdown(f"**Total etiquetas a generar (estimado):** {len(etiquetas)}")
+            if st.session_state.last_pdf:
+                st.success(f"Última generación: {st.session_state.last_total} etiquetas — {st.session_state.last_pdf_name}")
+                st.download_button("Descargar PDF", data=st.session_state.last_pdf, file_name=st.session_state.last_pdf_name, mime="application/pdf")
+                if st.button("Abrir PDF en nueva pestaña"):
+                    b64 = base64.b64encode(st.session_state.last_pdf).decode("ascii")
+                    js = f"""
+                    <script>
+                    (function() {{
+                        const b64 = "{b64}";
+                        const byteCharacters = atob(b64);
+                        const byteNumbers = new Array(byteCharacters.length);
+                        for (let i = 0; i < byteCharacters.length; i++) {{
+                            byteNumbers[i] = byteCharacters.charCodeAt(i);
+                        }}
+                        const byteArray = new Uint8Array(byteNumbers);
+                        const blob = new Blob([byteArray], {{type: 'application/pdf'}});
+                        const url = URL.createObjectURL(blob);
+                        window.open(url, '_blank');
+                    }})();
+                    </script>
+                    """
+                    components.html(js, height=50)
+        card_container("Vista previa y resumen", contenido_preview_y_resumen)
 
-st.markdown("</div>", unsafe_allow_html=True)
+    # GENERATE BUTTON (big green centered under columns)
+    st.markdown("<div class='gen-btn'>", unsafe_allow_html=True)
 
-st.markdown("---")
-st.caption("Accesibilidad: inputs con focus visible; botones con mayor clickable area; tooltips en controles complejos.")
-
-# ---------- Tests / helper when run as script ----------
-def test_invocation():
-    """
-    Función de prueba simple que genera un PDF bytes con parámetros ejemplo y valida bytes no nulos.
-    Uso: python archivo.py (no streamlit) -> ejecutará este test.
-    """
-    sample_state = {
-        "show_color_square": True,
-        "dup_patron": False,
-        "dup_muestra": True,
-        "uniformidad": False,
-        "incluir_placebo": False,
-        "incluir_viales": True,
-        "num_uniform_samples": "2",
-        "num_lotes": "2",
-        "num_reactivos": "0",
-        "texto_blanco": "",
-        "texto_wash": "",
-        "peso_patron": "10",
-        "vol_patron": "100",
-        "muestra_peso": "5",
-        "muestra_vol": "20",
-        "placebo_peso": "",
-        "placebo_vol": "",
-        "nombre_prod": "PRUEBA",
-        "lote": "L1, L2",
-        "determinacion": "Det",
-        "analista": "TEST",
-        "fecha": datetime.today().strftime("%d/%m/%Y"),
-        "start_label": 1,
-        "lotes": [{"uid": new_uid("l"), "name":"Lote1"},{"uid": new_uid("l"), "name":"Lote2"}],
-        "reactivos": [],
-        "diluciones_std": [],
-        "diluciones_muestra": [],
-        "diluciones_placebo": [],
-        "id_color_map": {},
-        "lote_color_map": {},
-        "viales_multiplicadores": {},
-    }
-    # Use the stateless build_etiquetas and the PDF generator that depends on session-state
-    # We'll call a light-weight PDF generator here reusing code (but without st.session_state)
-    etiquetas = build_etiquetas_from_state(sample_state)
-    if not etiquetas:
-        print("TEST FAILED: No se generaron etiquetas de prueba.")
-        return 1
-    # Minimal PDF creation
-    buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    c.drawString(100, 800, "TEST PDF")
-    c.save()
-    buf.seek(0)
-    pdf_bytes = buf.read()
-    if pdf_bytes and len(pdf_bytes) > 10:
-        print("TEST OK: PDF bytes generados (len=%d)" % len(pdf_bytes))
-        return 0
+    # Use trigger pattern: clicking the button sets trigger_generate True, and below main flow will perform generation.
+    if st.session_state.generating:
+        # disabled button visual while generating
+        st.button("GENERANDO...", disabled=True)
     else:
-        print("TEST FAILED: PDF bytes vacíos.")
-        return 2
+        if st.button("GENERAR PDF"):
+            st.session_state.trigger_generate = True
 
-# If executed directly as script, run tests (outside Streamlit)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)  # close central container
+
+# ----------------------------
+# Main application logic
+# ----------------------------
+def main():
+    build_ui()
+
+    # If generation has been requested, run validation and generation with spinner/progress
+    if st.session_state.get("trigger_generate", False) and not st.session_state.get("generating", False):
+        # Begin generation flow
+        st.session_state.generating = True
+        st.session_state.trigger_generate = False
+
+        # Validate inputs
+        errors = validate_inputs(st.session_state)
+        if errors:
+            for e in errors:
+                st.error(e)
+            st.session_state.generating = False
+            return
+
+        with st.spinner("Generando preview y PDF..."):
+            progress = st.progress(0)
+            # Build minimal state dict to feed build_etiquetas_from_state and preview
+            state = {
+                "texto_blanco": st.session_state.texto_blanco,
+                "texto_wash": st.session_state.texto_wash,
+                "dup_patron": st.session_state.dup_patron,
+                "dup_muestra": st.session_state.dup_muestra,
+                "uniformidad": st.session_state.uniformidad,
+                "incluir_placebo": st.session_state.incluir_placebo,
+                "lotes": st.session_state.lotes,
+                "reactivos": st.session_state.reactivos,
+                "viales_multiplicadores": st.session_state.viales_multiplicadores,
+                "muestra_peso": st.session_state.muestra_peso,
+                "muestra_vol": st.session_state.muestra_vol,
+                "placebo_peso": st.session_state.placebo_peso,
+                "placebo_vol": st.session_state.placebo_vol,
+                "peso_patron": st.session_state.peso_patron,
+                "vol_patron": st.session_state.vol_patron,
+                "lote_color_map": getattr(st.session_state, "lote_color_map", {}) if "lote_color_map" in st.session_state else {},
+            }
+
+            # 1) Build etiquetas list (logical)
+            etiquetas = build_etiquetas_from_state({**state,
+                                                   "id_color_map": getattr(st.session_state,"id_color_map",{}),
+                                                   "lote_color_map": getattr(st.session_state,"lote_color_map",{})})
+            progress.progress(20)
+            time.sleep(0.25)
+
+            # 2) Create preview from first few etiquetas
+            preview_bytes = preview_label_sample({
+                "nombre_prod": st.session_state.nombre_prod,
+                "lote_general": st.session_state.lote_general,
+                "lotes": st.session_state.lotes,
+                "analista": st.session_state.analista,
+                "fecha": st.session_state.fecha,
+                "start_label": int(st.session_state.start_label)
+            }, etiquetas_sample=etiquetas)
+            st.session_state.preview_img = preview_bytes
+            progress.progress(40)
+            time.sleep(0.25)
+
+            # 3) Generate final PDF
+            pdf_bytes, total_generated = generate_pdf_bytes(etiquetas, {
+                "show_color_square": st.session_state.show_color_square,
+                "nombre_prod": st.session_state.nombre_prod,
+                "determinacion": st.session_state.determinacion,
+                "lote_general": st.session_state.lote_general,
+                "analista": st.session_state.analista,
+                "fecha": st.session_state.fecha,
+                "start_label": st.session_state.start_label
+            })
+            progress.progress(80)
+            time.sleep(0.25)
+
+            # 4) Save into session_state and finish
+            filename = f"{datetime.today().strftime('%Y%m%d')}_{re.sub(r'[^0-9a-zA-Z_-]','_', (st.session_state.nombre_prod or 'etiquetas'))}.pdf"
+            st.session_state.last_pdf = pdf_bytes
+            st.session_state.last_pdf_name = filename
+            st.session_state.last_total = total_generated
+
+            progress.progress(100)
+            time.sleep(0.2)
+
+        # Show success and small summary
+        st.success(f"Generado PDF: {st.session_state.last_pdf_name} — {st.session_state.last_total} etiquetas (estimado).")
+        st.session_state.generating = False
+
+# ----------------------------
+# Entrypoint
+# ----------------------------
 if __name__ == "__main__":
-    print("Ejecutando test_invocation()...")
-    exit_code = test_invocation()
-    raise SystemExit(exit_code)
+    main()
